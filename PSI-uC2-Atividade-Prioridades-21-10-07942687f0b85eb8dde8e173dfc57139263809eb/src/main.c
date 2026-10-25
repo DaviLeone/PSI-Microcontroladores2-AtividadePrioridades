@@ -5,9 +5,16 @@
 
 #define LED_A_NODE DT_ALIAS(led0)
 #define LED_B_NODE DT_ALIAS(led2)
+#define LED_C_NODE DT_ALIAS(led1)                 /* LED comandado pela ISR */
+#define BUTTON_NODE DT_NODELABEL(user_button_0)   /* SW0 (pull-up) */
 
 static const struct gpio_dt_spec ledA = GPIO_DT_SPEC_GET(LED_A_NODE, gpios);
 static const struct gpio_dt_spec ledB = GPIO_DT_SPEC_GET(LED_B_NODE, gpios);
+static const struct gpio_dt_spec ledC = GPIO_DT_SPEC_GET(LED_C_NODE, gpios);
+static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(BUTTON_NODE, gpios);
+static struct gpio_callback button_cb_data;
+
+#define DEBOUNCE_MS 50
 
 /*
  * Escolha o caso de teste (1..6) editando CASO abaixo.
@@ -138,13 +145,61 @@ void thread_B(void *p1, void *p2, void *p3)
 K_THREAD_DEFINE(a_tid, 512, thread_A, NULL, NULL, NULL, PRIO_THREAD_A, 0, 0);
 K_THREAD_DEFINE(b_tid, 512, thread_B, NULL, NULL, NULL, PRIO_THREAD_B, 0, 0);
 
+
+/* ------------------------------------------------------------------
+ * ISR do botao: roda em contexto de interrupcao, ACIMA de qualquer thread
+ * (ate das cooperativas). Faz o minimo: alterna o LED, registra qual thread
+ * foi interrompida e avisa a main por semaforo.
+ * ------------------------------------------------------------------ */
+K_SEM_DEFINE(btn_sem, 0, 1);
+static volatile k_tid_t isr_interrompida;
+static volatile uint32_t isr_dur_ciclos;
+static volatile uint32_t isr_total;
+static uint32_t ultimo_btn_ms;
+
+static void button_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+    uint32_t t0 = k_cycle_get_32();
+    uint32_t agora = k_uptime_get_32();
+
+    if ((agora - ultimo_btn_ms) < DEBOUNCE_MS) {
+        return;                              /* ignora repique mecanico */
+    }
+    ultimo_btn_ms = agora;
+
+    gpio_pin_toggle_dt(&ledC);
+    isr_interrompida = k_current_get();      /* thread que estava rodando */
+    isr_total++;
+    isr_dur_ciclos = k_cycle_get_32() - t0;
+    k_sem_give(&btn_sem);
+}
+
+static const char *nome_thread(k_tid_t t)
+{
+    if (t == a_tid) {
+        return "thread A";
+    }
+    if (t == b_tid) {
+        return "thread B";
+    }
+    return "idle/main";
+}
+
 int main(void)
 {
-    if (!device_is_ready(ledA.port) || !device_is_ready(ledB.port)) {
+    if (!device_is_ready(ledA.port) || !device_is_ready(ledB.port) ||
+        !device_is_ready(ledC.port) || !gpio_is_ready_dt(&button)) {
         return 0;
     }
     gpio_pin_configure_dt(&ledA, GPIO_OUTPUT_INACTIVE);
     gpio_pin_configure_dt(&ledB, GPIO_OUTPUT_INACTIVE);
+    gpio_pin_configure_dt(&ledC, GPIO_OUTPUT_INACTIVE);
+
+    /* Botao com pull-up: interrupcao na borda de descida (pressionar) */
+    gpio_pin_configure_dt(&button, GPIO_INPUT | GPIO_PULL_UP);
+    gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_FALLING);
+    gpio_init_callback(&button_cb_data, button_isr, BIT(button.pin));
+    gpio_add_callback(button.port, &button_cb_data);
 
     overhead_ciclos = calibra_overhead();
 
@@ -159,9 +214,15 @@ int main(void)
 
     /* A main tem prioridade 0 (maior que A e B): serve de "batimento cardiaco" */
     while (1) {
-        k_sleep(K_SECONDS(1));
-        printk("[main] t=%lld ms | execucoes: A=%u B=%u\n",
-               k_uptime_get(), contagem_A, contagem_B);
+        /* Acorda quando a ISR sinaliza o botao ou a cada 1 s (heartbeat) */
+        if (k_sem_take(&btn_sem, K_SECONDS(1)) == 0) {
+            printk("[ISR] botao #%u: interrompeu %s | ISR durou %u us\n",
+                   isr_total, nome_thread(isr_interrompida),
+                   k_cyc_to_us_floor32(isr_dur_ciclos));
+        } else {
+            printk("[main] t=%lld ms | execucoes: A=%u B=%u\n",
+                   k_uptime_get(), contagem_A, contagem_B);
+        }
     }
     return 0;
 }
