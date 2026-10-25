@@ -1,7 +1,9 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
-#include <zephyr/sys/printk.h>
+#include <zephyr/logging/log.h>
+
+LOG_MODULE_REGISTER(prioridades, LOG_LEVEL_DBG);
 
 #define LED_A_NODE DT_ALIAS(led0)
 #define LED_B_NODE DT_ALIAS(led2)
@@ -66,6 +68,8 @@ static struct gpio_callback button_cb_data;
 /* Contadores de execucoes (usados pela main para detectar starvation) */
 static volatile uint32_t contagem_A, contagem_B;
 
+#define LIMITE_ATRASO_MS 5   /* acima disso, avisa que a ativacao atrasou */
+
 /* Custo (em ciclos) de uma chamada a k_cycle_get_32(), medido no boot */
 static uint32_t overhead_ciclos;
 
@@ -99,8 +103,15 @@ void thread_A(void *p1, void *p2, void *p3)
         uint32_t cyc = k_cycle_get_32() - ini_cyc - overhead_ciclos;
         fim_ms = k_uptime_get();
 
-        printk("[A] ini=%lld ms cpu=%u us wall=%lld ms atraso=%lld ms\n",
-               ini_ms, k_cyc_to_us_floor32(cyc), fim_ms - ini_ms, atraso_ms);
+        LOG_DBG("[A] ciclos: ini=%u delta=%u overhead=%u",
+                ini_cyc, cyc, overhead_ciclos);
+        LOG_INF("[A] ini=%lld ms cpu=%u us wall=%lld ms (preemptado ~%lld ms)",
+                ini_ms, k_cyc_to_us_floor32(cyc), fim_ms - ini_ms,
+                (fim_ms - ini_ms) - (int64_t)(k_cyc_to_us_floor32(cyc) / 1000U));
+        if (atraso_ms > LIMITE_ATRASO_MS) {
+            LOG_WRN("[A] ativacao atrasada em %lld ms (CPU ocupada por thread de maior prioridade)",
+                    atraso_ms);
+        }
 
         contagem_A++;
         primeira = false;
@@ -130,8 +141,15 @@ void thread_B(void *p1, void *p2, void *p3)
         uint32_t cyc = k_cycle_get_32() - ini_cyc - overhead_ciclos;
         fim_ms = k_uptime_get();
 
-        printk("[B] ini=%lld ms cpu=%u us wall=%lld ms atraso=%lld ms\n",
-               ini_ms, k_cyc_to_us_floor32(cyc), fim_ms - ini_ms, atraso_ms);
+        LOG_DBG("[B] ciclos: ini=%u delta=%u overhead=%u",
+                ini_cyc, cyc, overhead_ciclos);
+        LOG_INF("[B] ini=%lld ms cpu=%u us wall=%lld ms (preemptado ~%lld ms)",
+                ini_ms, k_cyc_to_us_floor32(cyc), fim_ms - ini_ms,
+                (fim_ms - ini_ms) - (int64_t)(k_cyc_to_us_floor32(cyc) / 1000U));
+        if (atraso_ms > LIMITE_ATRASO_MS) {
+            LOG_WRN("[B] ativacao atrasada em %lld ms (CPU ocupada por thread de maior prioridade)",
+                    atraso_ms);
+        }
 
         contagem_B++;
         primeira = false;
@@ -189,8 +207,12 @@ int main(void)
 {
     if (!device_is_ready(ledA.port) || !device_is_ready(ledB.port) ||
         !device_is_ready(ledC.port) || !gpio_is_ready_dt(&button)) {
+        LOG_ERR("GPIO (LEDs/botao) nao esta pronto");
         return 0;
     }
+
+    k_thread_name_set(a_tid, "thread_A");
+    k_thread_name_set(b_tid, "thread_B");
     gpio_pin_configure_dt(&ledA, GPIO_OUTPUT_INACTIVE);
     gpio_pin_configure_dt(&ledB, GPIO_OUTPUT_INACTIVE);
     gpio_pin_configure_dt(&ledC, GPIO_OUTPUT_INACTIVE);
@@ -205,23 +227,23 @@ int main(void)
 
     uint32_t hz = (uint32_t)sys_clock_hw_cycles_per_sec();
 
-    printk("=== Demonstracao de Preempcao com LEDs (CASO %d) ===\n", CASO);
-    printk("Clock do sistema: %u Hz (1 ciclo = %u ns)\n", hz, 1000000000U / hz);
-    printk("Tick do kernel: %d Hz | overhead k_cycle_get_32: %u ciclos\n",
-           CONFIG_SYS_CLOCK_TICKS_PER_SEC, overhead_ciclos);
-    printk("Thread A (led0): prioridade %d, sleep %d ms\n", PRIO_THREAD_A, TEMPO_A_MS);
-    printk("Thread B (led2): prioridade %d, sleep %d ms\n", PRIO_THREAD_B, TEMPO_B_MS);
+    LOG_INF("=== Demonstracao de Preempcao com LEDs (CASO %d) ===", CASO);
+    LOG_INF("Clock do sistema: %u Hz (1 ciclo = %u ns)", hz, 1000000000U / hz);
+    LOG_INF("Tick do kernel: %d Hz | overhead k_cycle_get_32: %u ciclos",
+            CONFIG_SYS_CLOCK_TICKS_PER_SEC, overhead_ciclos);
+    LOG_INF("Thread A (led0): prioridade %d, sleep %d ms", PRIO_THREAD_A, TEMPO_A_MS);
+    LOG_INF("Thread B (led2): prioridade %d, sleep %d ms", PRIO_THREAD_B, TEMPO_B_MS);
 
     /* A main tem prioridade 0 (maior que A e B): serve de "batimento cardiaco" */
     while (1) {
         /* Acorda quando a ISR sinaliza o botao ou a cada 1 s (heartbeat) */
         if (k_sem_take(&btn_sem, K_SECONDS(1)) == 0) {
-            printk("[ISR] botao #%u: interrompeu %s | ISR durou %u us\n",
-                   isr_total, nome_thread(isr_interrompida),
-                   k_cyc_to_us_floor32(isr_dur_ciclos));
+            LOG_INF("[ISR] botao #%u: interrompeu %s | ISR durou %u us",
+                    isr_total, nome_thread(isr_interrompida),
+                    k_cyc_to_us_floor32(isr_dur_ciclos));
         } else {
-            printk("[main] t=%lld ms | execucoes: A=%u B=%u\n",
-                   k_uptime_get(), contagem_A, contagem_B);
+            LOG_INF("[main] t=%lld ms | execucoes: A=%u B=%u",
+                    k_uptime_get(), contagem_A, contagem_B);
         }
     }
     return 0;
